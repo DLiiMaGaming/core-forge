@@ -1,15 +1,29 @@
-// store.ts — the forge's state: users, repositories (with their git refs), issues, pull requests,
-// comments and labels, all in memory over one shared ObjectStore. A deterministic clock (seeded
-// from MAKEFUN_TRIAL_NOW, advanced by a counter) keeps every exported byte reproducible.
+// store.ts — the forge's in-memory state.
+//
+// Everything the forge serves lives here: the three seeded users, every
+// repository with its refs/issues/pulls/labels, and the git object store.
+// Nothing in this file touches the wall clock or unseeded randomness: all
+// timestamps derive from a seeded, ticking clock, and every id derives from
+// counters and creation order, so two runs of the same request sequence
+// leave byte-identical state exports.
 
-import {
-  ObjectStore, buildTreeFromFiles, flattenTree, parseCommit, peelToCommit,
-} from './gitcore.ts';
+import { createHash } from 'node:crypto';
+
+export const ZERO_OID = '0'.repeat(40);
+export const VIEWER_LOGIN = 'adaiversen';
+export const VIEWER_ID = 1000;
+export const COMMIT_AUTHOR = 'ada iversen <adaiversen@forge.local>';
+export const EPOCH_BASE = '2026-01-01T00:00:00Z';
 
 export interface UserRec {
   login: string;
   id: number;
   name: string;
+}
+
+export interface LabelRec {
+  name: string;
+  color: string;
 }
 
 export interface CommentRec {
@@ -18,11 +32,13 @@ export interface CommentRec {
   createdSeq: number;
 }
 
+export type IssueState = 'open' | 'closed';
+
 export interface IssueRec {
   number: number;
   title: string;
   body: string;
-  state: 'open' | 'closed';
+  state: IssueState;
   labels: string[];
   comments: CommentRec[];
   nextCommentId: number;
@@ -33,7 +49,7 @@ export interface PullRec {
   number: number;
   title: string;
   body: string;
-  state: 'open' | 'closed';
+  state: IssueState;
   merged: boolean;
   headRef: string;
   baseRef: string;
@@ -42,11 +58,6 @@ export interface PullRec {
   mergedAt: string | null;
   mergeCommitSha: string | null;
   createdSeq: number;
-}
-
-export interface LabelRec {
-  name: string;
-  color: string;
 }
 
 export interface RepoRec {
@@ -64,63 +75,164 @@ export interface RepoRec {
   createdSeq: number;
 }
 
+export interface StoredObject {
+  type: string;
+  data: Buffer;
+}
+
+/** Git object id: SHA-1 over "<type> <len>\0" + payload. */
+export function oidOf(type: string, data: Buffer): string {
+  const head = Buffer.from(`${type} ${data.length}\0`, 'utf8');
+  return createHash('sha1').update(head).update(data).digest('hex');
+}
+
+/** ISO-8601 without milliseconds, e.g. 2026-01-01T00:00:00Z. */
+export function isoNoMillis(ms: number): string {
+  return new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+/** REST-facing derived id: repo id scaled, plus the issue/pull number. */
+export function restId(repoId: number, number: number): number {
+  return repoId * 1_000_000 + number;
+}
+
+export function commentRestId(repoId: number, number: number, commentId: number): number {
+  return repoId * 1_000_000 + number * 1000 + commentId;
+}
+
+/** Global (GraphQL node) id: base64 of a colon-joined key. */
+export function globalId(kind: string, repoId: number, number?: number, commentId?: number): string {
+  const parts = [kind, String(repoId)];
+  if (number !== undefined) parts.push(String(number));
+  if (commentId !== undefined) parts.push(String(commentId));
+  return Buffer.from(parts.join(':'), 'utf8').toString('base64');
+}
+
+export interface ParsedGlobalId {
+  kind: string;
+  repoId: number;
+  number?: number;
+  commentId?: number;
+}
+
+/** Decode a global id, or null when it does not match a known shape. */
+export function parseGlobalId(id: string): ParsedGlobalId | null {
+  let text: string;
+  try {
+    text = Buffer.from(id, 'base64').toString('utf8');
+  } catch {
+    return null;
+  }
+  const parts = text.split(':');
+  if (parts.length < 2 || parts.length > 4) return null;
+  const kind = parts[0];
+  const repoId = Number(parts[1]);
+  if (!Number.isInteger(repoId)) return null;
+  if (kind === 'repo' && parts.length === 2) return { kind, repoId };
+  if ((kind === 'issue' || kind === 'pull') && parts.length === 3) {
+    const number = Number(parts[2]);
+    if (!Number.isInteger(number)) return null;
+    return { kind, repoId, number };
+  }
+  if (kind === 'comment' && parts.length === 4) {
+    const number = Number(parts[2]);
+    const commentId = Number(parts[3]);
+    if (!Number.isInteger(number) || !Number.isInteger(commentId)) return null;
+    return { kind, repoId, number, commentId };
+  }
+  return null;
+}
+
 export class Forge {
-  readonly store = new ObjectStore();
   readonly users = new Map<string, UserRec>();
   readonly repos = new Map<string, RepoRec>();
   readonly repoOrder: RepoRec[] = [];
+  readonly objects = new Map<string, StoredObject>();
+  private nextRepoId = 100001;
   private seq = 0;
   private clockTicks = 0;
-  private readonly clockBaseMs: number;
-  private nextRepoId = 100001;
-  /** Viewer identity for the trial: the suite's one scenario user. */
-  readonly viewer: UserRec;
+  private readonly baseMs: number;
 
   constructor() {
-    const nowEnv = process.env.MAKEFUN_TRIAL_NOW;
-    const parsed = nowEnv ? Date.parse(nowEnv) : NaN;
-    this.clockBaseMs = Number.isFinite(parsed) ? parsed : Date.parse('2026-01-01T00:00:00Z');
-    this.viewer = { login: 'adaiversen', id: 1000, name: 'ada iversen' };
-    this.users.set(this.viewer.login, this.viewer);
-    this.users.set('quinnkeller', { login: 'quinnkeller', id: 1001, name: 'quinn keller' });
-    this.users.set('olgabauer', { login: 'olgabauer', id: 1002, name: 'olga bauer' });
+    const seed = process.env.MAKEFUN_TRIAL_NOW ?? '';
+    const parsed = seed === '' ? NaN : Date.parse(seed);
+    this.baseMs = Number.isNaN(parsed) ? Date.parse(EPOCH_BASE) : parsed;
+    for (const [login, id, name] of [
+      ['adaiversen', 1000, 'ada iversen'],
+      ['quinnkeller', 1001, 'quinn keller'],
+      ['olgabauer', 1002, 'olga bauer'],
+    ] as const) {
+      this.users.set(login, { login, id, name });
+    }
   }
 
+  /** The single global creation-order counter. */
   nextSeq(): number {
+    const value = this.seq;
     this.seq += 1;
-    return this.seq;
+    return value;
   }
 
-  /** Deterministic timestamp: trial base + one second per call, in call order. */
+  /** Display timestamp for a record: base + its creation sequence, in seconds. */
+  isoAt(seq: number): string {
+    return isoNoMillis(this.baseMs + seq * 1000);
+  }
+
+  /** Deterministic clock: base + one second per tick. */
   nowIso(): string {
-    const ms = this.clockBaseMs + this.clockTicks * 1000;
+    const value = isoNoMillis(this.baseMs + this.clockTicks * 1000);
     this.clockTicks += 1;
-    return new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    return value;
   }
 
+  /** Deterministic clock in epoch seconds, one tick per call. */
   nowEpochSeconds(): number {
-    const seconds = Math.floor(this.clockBaseMs / 1000) + this.clockTicks;
+    const value = Math.floor(this.baseMs / 1000) + this.clockTicks;
     this.clockTicks += 1;
-    return seconds;
+    return value;
   }
 
-  // ------------------------------------------------------------------ repositories
+  // ---- git objects -------------------------------------------------------
+
+  putObject(type: string, data: Buffer): string {
+    const oid = oidOf(type, data);
+    if (!this.objects.has(oid)) this.objects.set(oid, { type, data });
+    return oid;
+  }
+
+  getObject(oid: string): StoredObject | undefined {
+    return this.objects.get(oid);
+  }
+
+  hasObject(oid: string): boolean {
+    return this.objects.has(oid);
+  }
+
+  // ---- repositories ------------------------------------------------------
 
   repoKey(owner: string, name: string): string {
     return `${owner}/${name}`;
   }
 
-  getRepo(owner: string, name: string): RepoRec | undefined {
+  repoByKey(owner: string, name: string): RepoRec | undefined {
     return this.repos.get(this.repoKey(owner, name));
   }
 
-  createRepo(owner: string, name: string, init: { description?: string; isPrivate?: boolean }): RepoRec {
+  repoById(id: number): RepoRec | undefined {
+    return this.repoOrder.find((repo) => repo.id === id);
+  }
+
+  reposOf(owner: string): RepoRec[] {
+    return this.repoOrder.filter((repo) => repo.owner === owner);
+  }
+
+  createRepo(owner: string, name: string, description: string, isPrivate: boolean): RepoRec {
     const repo: RepoRec = {
       id: this.nextRepoId,
       owner,
       name,
-      description: init.description ?? '',
-      isPrivate: init.isPrivate ?? false,
+      description,
+      isPrivate,
       defaultBranch: 'main',
       refs: new Map(),
       issues: new Map(),
@@ -137,134 +249,59 @@ export class Forge {
 
   deleteRepo(repo: RepoRec): void {
     this.repos.delete(this.repoKey(repo.owner, repo.name));
-    const index = this.repoOrder.indexOf(repo);
-    if (index !== -1) this.repoOrder.splice(index, 1);
+    const at = this.repoOrder.indexOf(repo);
+    if (at >= 0) this.repoOrder.splice(at, 1);
   }
 
-  reposOf(owner: string): RepoRec[] {
-    return this.repoOrder.filter((repo) => repo.owner === owner);
-  }
+  // ---- issues and pulls (one shared number counter per repo) -------------
 
-  // ------------------------------------------------------------------ git helpers over a repo
-
-  refTip(repo: RepoRec, ref: string): string | undefined {
-    return repo.refs.get(ref);
-  }
-
-  branchTip(repo: RepoRec, branch: string): string | undefined {
-    return repo.refs.get(`refs/heads/${branch}`);
-  }
-
-  /** The commit oid a ref points at (peeling tags), or null when unborn/unknown. */
-  refCommit(repo: RepoRec, ref: string): string | null {
-    const oid = repo.refs.get(ref);
-    if (!oid) return null;
-    return peelToCommit(this.store, oid);
-  }
-
-  defaultTip(repo: RepoRec): string | null {
-    return this.refCommit(repo, `refs/heads/${repo.defaultBranch}`);
-  }
-
-  /** Files (path -> {mode, oid}) at a commit oid; empty map for null. */
-  filesAt(commitOid: string | null): Map<string, { mode: string; oid: string }> {
-    if (!commitOid) return new Map();
-    const obj = this.store.get(commitOid);
-    if (!obj || obj.type !== 'commit') return new Map();
-    return flattenTree(this.store, parseCommit(obj.data).tree);
-  }
-
-  /** Create a commit on top of `parent` (or a root commit) with the given file map. */
-  commitFiles(repo: RepoRec, files: Map<string, { mode: string; oid: string }>, parent: string | null, message: string): string {
-    const tree = buildTreeFromFiles(this.store, files);
-    const seconds = this.nowEpochSeconds();
-    const identity = `${this.viewer.name} <${this.viewer.login}@forge.local>`;
-    const lines = [`tree ${tree}`];
-    if (parent) lines.push(`parent ${parent}`);
-    lines.push(`author ${identity} ${seconds} +0000`);
-    lines.push(`committer ${identity} ${seconds} +0000`);
-    const data = Buffer.from(`${lines.join('\n')}\n\n${message}\n`, 'utf8');
-    return this.store.put('commit', data);
-  }
-
-  // ------------------------------------------------------------------ issues & pulls
-
-  createIssue(repo: RepoRec, init: { title: string; body?: string; labels?: string[] }): IssueRec {
-    const number = repo.nextNumber;
-    repo.nextNumber += 1;
+  createIssue(repo: RepoRec, title: string, body: string, labels: string[]): IssueRec {
     const issue: IssueRec = {
-      number,
-      title: init.title,
-      body: init.body ?? '',
+      number: repo.nextNumber,
+      title,
+      body,
       state: 'open',
-      labels: [...(init.labels ?? [])],
+      labels: [...labels],
       comments: [],
       nextCommentId: 1,
       createdSeq: this.nextSeq(),
     };
-    repo.issues.set(number, issue);
+    repo.nextNumber += 1;
+    repo.issues.set(issue.number, issue);
     return issue;
   }
 
-  createPull(repo: RepoRec, init: { title: string; body?: string; headRef: string; baseRef: string; headSha: string; baseSha: string }): PullRec {
-    const number = repo.nextNumber;
-    repo.nextNumber += 1;
+  createPull(
+    repo: RepoRec,
+    title: string,
+    body: string,
+    headRef: string,
+    baseRef: string,
+    headSha: string,
+    baseSha: string,
+  ): PullRec {
     const pull: PullRec = {
-      number,
-      title: init.title,
-      body: init.body ?? '',
+      number: repo.nextNumber,
+      title,
+      body,
       state: 'open',
       merged: false,
-      headRef: init.headRef,
-      baseRef: init.baseRef,
-      createdHeadSha: init.headSha,
-      createdBaseSha: init.baseSha,
+      headRef,
+      baseRef,
+      createdHeadSha: headSha,
+      createdBaseSha: baseSha,
       mergedAt: null,
       mergeCommitSha: null,
       createdSeq: this.nextSeq(),
     };
-    repo.pulls.set(number, pull);
+    repo.nextNumber += 1;
+    repo.pulls.set(pull.number, pull);
     return pull;
   }
 
-  // ------------------------------------------------------------------ global ids (GraphQL)
+  // ---- deterministic export ----------------------------------------------
 
-  globalId(kind: 'repo' | 'issue' | 'pull' | 'comment', repo: RepoRec, number?: number, commentId?: number): string {
-    let raw: string;
-    if (kind === 'repo') raw = `repo:${repo.id}`;
-    else if (kind === 'issue') raw = `issue:${repo.id}:${number}`;
-    else if (kind === 'pull') raw = `pull:${repo.id}:${number}`;
-    else raw = `comment:${repo.id}:${number}:${commentId}`;
-    return Buffer.from(raw, 'utf8').toString('base64');
-  }
-
-  /** Decode a global id produced by globalId(); null when the shape is foreign. */
-  parseGlobalId(id: string): { kind: string; repoId: number; number?: number; commentId?: number } | null {
-    let raw: string;
-    try {
-      raw = Buffer.from(id, 'base64').toString('utf8');
-    } catch {
-      return null;
-    }
-    const parts = raw.split(':');
-    if (parts[0] === 'repo' && parts.length === 2) return { kind: 'repo', repoId: Number(parts[1]) };
-    if (parts[0] === 'issue' && parts.length === 3) return { kind: 'issue', repoId: Number(parts[1]), number: Number(parts[2]) };
-    if (parts[0] === 'pull' && parts.length === 3) return { kind: 'pull', repoId: Number(parts[1]), number: Number(parts[2]) };
-    if (parts[0] === 'comment' && parts.length === 4) return { kind: 'comment', repoId: Number(parts[1]), number: Number(parts[2]), commentId: Number(parts[3]) };
-    return null;
-  }
-
-  repoById(id: number): RepoRec | undefined {
-    return this.repoOrder.find((repo) => repo.id === id);
-  }
-
-  // ------------------------------------------------------------------ deterministic export
-
-  /**
-   * Serialize the whole forge deterministically: repositories in creation order, refs sorted,
-   * issues/pulls by number, git objects sorted by oid with base64 payloads. Two runs of the
-   * same trial produce byte-identical output.
-   */
+  /** Byte-identical export of the whole forge state (see GET /__makefun/state). */
   exportState(): string {
     const repos = this.repoOrder.map((repo) => ({
       id: repo.id,
@@ -273,32 +310,40 @@ export class Forge {
       description: repo.description,
       private: repo.isPrivate,
       default_branch: repo.defaultBranch,
-      refs: [...repo.refs.entries()].sort(([a], [b]) => (a < b ? -1 : 1)).map(([ref, oid]) => ({ ref, oid })),
-      labels: [...repo.labels.values()].sort((a, b) => (a.name < b.name ? -1 : 1)).map((label) => ({ name: label.name, color: label.color })),
-      issues: [...repo.issues.values()].sort((a, b) => a.number - b.number).map((issue) => ({
-        number: issue.number,
-        title: issue.title,
-        body: issue.body,
-        state: issue.state,
-        labels: [...issue.labels].sort(),
-        comments: issue.comments.map((comment) => ({ id: comment.id, body: comment.body })),
-      })),
-      pulls: [...repo.pulls.values()].sort((a, b) => a.number - b.number).map((pull) => ({
-        number: pull.number,
-        title: pull.title,
-        body: pull.body,
-        state: pull.state,
-        merged: pull.merged,
-        head: pull.headRef,
-        base: pull.baseRef,
-        head_sha: pull.createdHeadSha,
-        base_sha: pull.createdBaseSha,
-        merged_at: pull.mergedAt,
-        merge_commit_sha: pull.mergeCommitSha,
-      })),
+      refs: [...repo.refs.entries()]
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        .map(([ref, oid]) => ({ ref, oid })),
+      labels: [...repo.labels.values()]
+        .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+        .map((label) => ({ name: label.name, color: label.color })),
+      issues: [...repo.issues.values()]
+        .sort((a, b) => a.number - b.number)
+        .map((issue) => ({
+          number: issue.number,
+          title: issue.title,
+          body: issue.body,
+          state: issue.state,
+          labels: [...issue.labels].sort(),
+          comments: issue.comments.map((comment) => ({ id: comment.id, body: comment.body })),
+        })),
+      pulls: [...repo.pulls.values()]
+        .sort((a, b) => a.number - b.number)
+        .map((pull) => ({
+          number: pull.number,
+          title: pull.title,
+          body: pull.body,
+          state: pull.state,
+          merged: pull.merged,
+          head: pull.headRef,
+          base: pull.baseRef,
+          head_sha: pull.createdHeadSha,
+          base_sha: pull.createdBaseSha,
+          merged_at: pull.mergedAt,
+          merge_commit_sha: pull.mergeCommitSha,
+        })),
     }));
-    const objects = [...this.store.objects.entries()]
-      .sort(([a], [b]) => (a < b ? -1 : 1))
+    const objects = [...this.objects.entries()]
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
       .map(([oid, obj]) => ({ oid, type: obj.type, data: obj.data.toString('base64') }));
     return JSON.stringify({ version: 1, repos, objects });
   }
